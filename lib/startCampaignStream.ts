@@ -120,23 +120,48 @@ export async function startCampaignStream(campaignId: string) {
   const twitter = new TwitterApi(token);
 
   const now = new Date();
-  const users = await User.find(
+  const fields = "twitterId username avatar sinceId lastPolledAt nextPollAt";
+
+  // Step 1: grab users that are due OR never polled
+  const dueUsers = await User.find(
     {
       enabled: { $ne: false },
-      $or: [{ nextPollAt: { $lte: now } }, { nextPollAt: { $exists: false } }],
+      $or: [
+        { nextPollAt: { $lte: now } },
+        { nextPollAt: { $exists: false } },
+        { lastPolledAt: { $exists: false } },
+      ],
     },
-    "twitterId username avatar sinceId lastPolledAt nextPollAt"
+    fields
   )
     .sort({ lastPolledAt: 1, _id: 1 })
     .limit(MAX_USERS_PER_RUN)
     .lean();
 
+  // Step 2: top up with oldest-polled users to fill the batch
+  let users = dueUsers;
+  if (users.length < MAX_USERS_PER_RUN) {
+    const need = MAX_USERS_PER_RUN - users.length;
+    const exclude = users.map((u) => u._id);
+    const topUp = await User.find(
+      {
+        enabled: { $ne: false },
+        _id: { $nin: exclude },
+      },
+      fields
+    )
+      .sort({ lastPolledAt: 1, _id: 1 })
+      .limit(need)
+      .lean();
+    users = users.concat(topUp);
+  }
+
   if (!users.length) {
-    console.warn("⚠ No registered users ready for polling");
+    console.warn("⚠ No users to poll");
     return;
   }
-  console.log(`ℹ Polling ${users.length} users: ${users.map(u => u.username).join(", ")}`);
 
+  console.log("Polling users:", users.map((u) => u.username).join(", "));
   const deltaMap: Record<
     string,
     { author_id: string; username: string; avatar: string; score: number }
@@ -182,7 +207,10 @@ export async function startCampaignStream(campaignId: string) {
         console.log(`   Calculated score: ${score}`);
 
         await TrackedTweet.updateOne(
-          { campaignId: new mongoose.Types.ObjectId(campaignId), tweetId: tw.id! },
+          {
+            campaignId: new mongoose.Types.ObjectId(campaignId),
+            tweetId: tw.id!,
+          },
           {
             $setOnInsert: {
               authorId: tw.author_id!,
@@ -234,7 +262,12 @@ export async function startCampaignStream(campaignId: string) {
       console.warn(`⚠ Poll fail @${u.username}: ${e?.message || e}`);
       await User.updateOne(
         { _id: (u as any)._id },
-        { $set: { lastPolledAt: new Date(), nextPollAt: new Date(Date.now() + 10 * 60 * 1000) } }
+        {
+          $set: {
+            lastPolledAt: new Date(),
+            nextPollAt: new Date(Date.now() + 10 * 60 * 1000),
+          },
+        }
       );
     }
   }
@@ -242,7 +275,6 @@ export async function startCampaignStream(campaignId: string) {
   ensureTime(300);
 
   console.log(`Total matched tweets this run: ${totalMatchedTweets}`);
-  
 
   const deltaRows = Object.values(deltaMap);
   if (!deltaRows.length) {
@@ -255,7 +287,10 @@ export async function startCampaignStream(campaignId: string) {
     { data: 1 }
   ).lean<{ data: any[] }>();
 
-  const totalsById = new Map<string, { author_id: string; username: string; avatar: string; score: number }>();
+  const totalsById = new Map<
+    string,
+    { author_id: string; username: string; avatar: string; score: number }
+  >();
 
   if (existing?.data?.length) {
     for (const row of existing.data) {
@@ -279,14 +314,23 @@ export async function startCampaignStream(campaignId: string) {
     }
   }
 
-  const merged = Array.from(totalsById.values()).sort((a, b) => b.score - a.score);
+  const merged = Array.from(totalsById.values()).sort(
+    (a, b) => b.score - a.score
+  );
 
   await Leaderboard.updateOne(
     { campaignId: new mongoose.Types.ObjectId(campaignId) },
     { $set: { data: merged, updatedAt: new Date() } },
     { upsert: true }
   );
-  console.log(`✅ Leaderboard updated for ${campaignId}: ${deltaRows.length} authors got points, total delta points: ${deltaRows.reduce((sum, r) => sum + r.score, 0)}`);
+  console.log(
+    `✅ Leaderboard updated for ${campaignId}: ${
+      deltaRows.length
+    } authors got points, total delta points: ${deltaRows.reduce(
+      (sum, r) => sum + r.score,
+      0
+    )}`
+  );
 }
 
 /* ========================= 72H HYDRATOR ========================= */
@@ -308,15 +352,13 @@ export async function refreshTweetMetrics(campaignId: string) {
   }
   const twitter = new TwitterApi(token);
 
-  const due = await TrackedTweet.find(
-    {
-      campaignId: new mongoose.Types.ObjectId(campaignId),
-      nextRefreshAt: { $lte: new Date() },
-      refreshStage: { $lt: REFRESH_OFFSETS.length },
-    }
-  )
+  const due = (await TrackedTweet.find({
+    campaignId: new mongoose.Types.ObjectId(campaignId),
+    nextRefreshAt: { $lte: new Date() },
+    refreshStage: { $lt: REFRESH_OFFSETS.length },
+  })
     .limit(HYDRATE_BATCH_TWEETS)
-    .lean() as TrackedTweetDoc[];
+    .lean()) as TrackedTweetDoc[];
 
   console.log(`ℹ ${due.length} tweets due for hydration`);
 
@@ -329,7 +371,10 @@ export async function refreshTweetMetrics(campaignId: string) {
   const liveById = new Map<string, any>();
   for (const t of res.data ?? []) liveById.set(t.id, t);
 
-  const hydrateDelta: Record<string, { author_id: string; username: string; avatar: string; score: number }> = {};
+  const hydrateDelta: Record<
+    string,
+    { author_id: string; username: string; avatar: string; score: number }
+  > = {};
 
   for (const doc of due) {
     const live = liveById.get(doc.tweetId);
@@ -343,15 +388,25 @@ export async function refreshTweetMetrics(campaignId: string) {
     }
 
     const newScore = scoreCreatorPost(
-      { id: live.id, text: live.text || "", created_at: live.created_at, public_metrics: live.public_metrics },
+      {
+        id: live.id,
+        text: live.text || "",
+        created_at: live.created_at,
+        public_metrics: live.public_metrics,
+      },
       0
     );
 
     const delta = Math.max(0, newScore - (doc.lastScore || 0));
 
-    const nextStage = Math.min((doc.refreshStage || 0) + 1, REFRESH_OFFSETS.length);
+    const nextStage = Math.min(
+      (doc.refreshStage || 0) + 1,
+      REFRESH_OFFSETS.length
+    );
     const nextAt =
-      nextStage < REFRESH_OFFSETS.length ? new Date(Date.now() + REFRESH_OFFSETS[nextStage]) : null;
+      nextStage < REFRESH_OFFSETS.length
+        ? new Date(Date.now() + REFRESH_OFFSETS[nextStage])
+        : null;
 
     await TrackedTweet.updateOne(
       { campaignId: doc.campaignId, tweetId: doc.tweetId },
@@ -376,7 +431,9 @@ export async function refreshTweetMetrics(campaignId: string) {
         };
       }
       hydrateDelta[authorId].score += delta;
-      console.log(`💧 Hydrated tweet ${doc.tweetId} -> +${delta} points for @${doc.username}`);
+      console.log(
+        `💧 Hydrated tweet ${doc.tweetId} -> +${delta} points for @${doc.username}`
+      );
     }
   }
 
@@ -393,7 +450,10 @@ export async function refreshTweetMetrics(campaignId: string) {
     { data: 1 }
   ).lean<{ data: any[] }>();
 
-  const totalsById = new Map<string, { author_id: string; username: string; avatar: string; score: number }>();
+  const totalsById = new Map<
+    string,
+    { author_id: string; username: string; avatar: string; score: number }
+  >();
 
   if (existing?.data?.length) {
     for (const row of existing.data) {
@@ -417,7 +477,9 @@ export async function refreshTweetMetrics(campaignId: string) {
     }
   }
 
-  const merged = Array.from(totalsById.values()).sort((a, b) => b.score - a.score);
+  const merged = Array.from(totalsById.values()).sort(
+    (a, b) => b.score - a.score
+  );
 
   await Leaderboard.updateOne(
     { campaignId: new mongoose.Types.ObjectId(campaignId) },
@@ -425,5 +487,12 @@ export async function refreshTweetMetrics(campaignId: string) {
     { upsert: true }
   );
 
-  console.log(`✅ Hydration leaderboard updated for ${campaignId}: ${deltaRows.length} authors, total delta points: ${deltaRows.reduce((sum, r) => sum + r.score, 0)}`);
+  console.log(
+    `✅ Hydration leaderboard updated for ${campaignId}: ${
+      deltaRows.length
+    } authors, total delta points: ${deltaRows.reduce(
+      (sum, r) => sum + r.score,
+      0
+    )}`
+  );
 }
