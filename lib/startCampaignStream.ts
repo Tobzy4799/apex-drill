@@ -51,8 +51,8 @@ const TrackedTweet =
 
 /* ----------------------- Tunables ----------------------- */
 const SOFT_BUDGET_MS = 7000;
-const MAX_USERS_PER_RUN = 40;
-const MAX_RESULTS = 60;
+const MAX_USERS_PER_RUN = 5; // your current setting
+const MAX_RESULTS = 2;
 const TWEET_FIELDS = "public_metrics,author_id,text,created_at";
 const USE_ROLLING_WINDOW = true;
 const ROLLING_DAYS = 3;
@@ -93,7 +93,7 @@ function matchesAny(text: string, regs: RegExp[]) {
 
 /* ======================= NEW-TWEET POLLER ======================= */
 export async function startCampaignStream(campaignId: string) {
-  console.log(`▶ Starting campaign stream for ${campaignId}`);
+  console.log(`▶️ Starting campaign stream for ${campaignId}`);
   const started = Date.now();
   const timeLeft = () => SOFT_BUDGET_MS - (Date.now() - started);
   const ensureTime = (reserve = 250) => {
@@ -161,6 +161,17 @@ export async function startCampaignStream(campaignId: string) {
     return;
   }
 
+  // ✅ FIX A: pre-mark the whole batch so rotation always advances,
+  // even if we break for time budget before touching some users.
+  try {
+    await User.updateMany(
+      { _id: { $in: users.map(u => (u as any)._id) } },
+      { $set: { lastPolledAt: new Date() } }
+    );
+  } catch (e) {
+    console.warn("⚠ Failed to pre-mark batch users:", (e as any)?.message || e);
+  }
+
   console.log("Polling users:", users.map((u) => u.username).join(", "));
   const deltaMap: Record<
     string,
@@ -168,7 +179,12 @@ export async function startCampaignStream(campaignId: string) {
   > = {};
 
   for (const u of users) {
-    ensureTime(600);
+    // ✅ FIX B: soft budget check — break instead of throw
+    if (timeLeft() < 600) {
+      console.warn("⏱ Budget low; breaking loop to finish cleanly");
+      break;
+    }
+
     try {
       const params: Record<string, any> = {
         max_results: MAX_RESULTS,
@@ -253,7 +269,7 @@ export async function startCampaignStream(campaignId: string) {
         {
           $set: {
             sinceId: newest ?? u.sinceId ?? null,
-            lastPolledAt: new Date(),
+            lastPolledAt: new Date(),   // kept
             nextPollAt,
           },
         }
@@ -335,7 +351,7 @@ export async function startCampaignStream(campaignId: string) {
 
 /* ========================= 72H HYDRATOR ========================= */
 export async function refreshTweetMetrics(campaignId: string) {
-  console.log(`▶ Starting hydration for ${campaignId}`);
+  console.log(`▶️ Starting hydration for ${campaignId}`);
   const started = Date.now();
   const timeLeft = () => HYDRATE_SOFT_BUDGET_MS - (Date.now() - started);
   const ensureTime = (reserve = 300) => {
