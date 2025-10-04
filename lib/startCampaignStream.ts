@@ -52,7 +52,12 @@ const TrackedTweet =
 /* ----------------------- Tunables ----------------------- */
 const SOFT_BUDGET_MS = 7000;
 const MAX_USERS_PER_RUN = 5; // your current setting
-const MAX_RESULTS = 6;
+
+// IMPORTANT: Twitter /2/users/:id/tweets requires 5 <= max_results <= 100.
+// We'll clamp whatever you configure into that legal window.
+const RAW_MAX_RESULTS = Number(process.env.MAX_RESULTS || 60);
+const MAX_RESULTS = Math.max(5, Math.min(100, isNaN(RAW_MAX_RESULTS) ? 60 : RAW_MAX_RESULTS));
+
 const TWEET_FIELDS = "public_metrics,author_id,text,created_at";
 const USE_ROLLING_WINDOW = true;
 const ROLLING_DAYS = 3;
@@ -161,8 +166,7 @@ export async function startCampaignStream(campaignId: string) {
     return;
   }
 
-  // ✅ FIX A: pre-mark the whole batch so rotation always advances,
-  // even if we break for time budget before touching some users.
+  // Pre-mark batch so rotation advances even if we exit early
   try {
     await User.updateMany(
       { _id: { $in: users.map(u => (u as any)._id) } },
@@ -172,28 +176,41 @@ export async function startCampaignStream(campaignId: string) {
     console.warn("⚠ Failed to pre-mark batch users:", (e as any)?.message || e);
   }
 
-  console.log("Polling users:", users.map((u) => u.username).join(", "));
+  console.log(
+    `Polling users: ${users.map((u) => u.username).join(", ")} (max_results=${MAX_RESULTS})`
+  );
+
   const deltaMap: Record<
     string,
     { author_id: string; username: string; avatar: string; score: number }
   > = {};
 
   for (const u of users) {
-    // ✅ FIX B: soft budget check — break instead of throw
     if (timeLeft() < 600) {
       console.warn("⏱ Budget low; breaking loop to finish cleanly");
       break;
     }
 
-    try {
-      const params: Record<string, any> = {
-        max_results: MAX_RESULTS,
-        "tweet.fields": TWEET_FIELDS,
-      };
-      if (u.sinceId) params.since_id = u.sinceId;
-      if (USE_ROLLING_WINDOW) params.start_time = nowIsoMinusDays(ROLLING_DAYS);
+    // Build params safely (respect Twitter constraints)
+    const baseParams: Record<string, any> = {
+      max_results: MAX_RESULTS, // already clamped 5..100
+      "tweet.fields": TWEET_FIELDS,
+    };
 
-      const tl = await twitter.v2.userTimeline(u.twitterId, params);
+    // Only include start_time when we don't have a sinceId and the rolling window is enabled
+    if (!u.sinceId && USE_ROLLING_WINDOW) {
+      baseParams.start_time = nowIsoMinusDays(ROLLING_DAYS);
+    }
+    if (u.sinceId) {
+      baseParams.since_id = u.sinceId;
+    }
+
+    try {
+      console.log(
+        `➡️ userTimeline(@${u.username}/${u.twitterId}) with params: ${JSON.stringify(baseParams)}`
+      );
+
+      const tl = await twitter.v2.userTimeline(u.twitterId, baseParams);
       const tweets = tl.data?.data ?? [];
 
       console.log(`ℹ @${u.username} fetched ${tweets.length} tweets`);
@@ -208,8 +225,6 @@ export async function startCampaignStream(campaignId: string) {
         matchedCount++;
         totalMatchedTweets++;
 
-        console.log(`✅ @${u.username} matched tweet ${tw.id}`);
-
         const score = scoreCreatorPost(
           {
             id: tw.id!,
@@ -219,8 +234,6 @@ export async function startCampaignStream(campaignId: string) {
           },
           0
         );
-
-        console.log(`   Calculated score: ${score}`);
 
         await TrackedTweet.updateOne(
           {
@@ -269,7 +282,7 @@ export async function startCampaignStream(campaignId: string) {
         {
           $set: {
             sinceId: newest ?? u.sinceId ?? null,
-            lastPolledAt: new Date(),   // kept
+            lastPolledAt: new Date(),
             nextPollAt,
           },
         }
@@ -339,6 +352,7 @@ export async function startCampaignStream(campaignId: string) {
     { $set: { data: merged, updatedAt: new Date() } },
     { upsert: true }
   );
+
   console.log(
     `✅ Leaderboard updated for ${campaignId}: ${
       deltaRows.length
