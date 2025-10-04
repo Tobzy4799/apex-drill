@@ -51,7 +51,7 @@ const TrackedTweet =
 
 /* ----------------------- Tunables ----------------------- */
 const SOFT_BUDGET_MS = 7000;
-const MAX_USERS_PER_RUN = 5;
+const MAX_USERS_PER_RUN = 6;
 const MAX_RESULTS = 60;
 const TWEET_FIELDS = "public_metrics,author_id,text,created_at";
 const USE_ROLLING_WINDOW = true;
