@@ -90,6 +90,7 @@ function matchesAny(text: string, regs: RegExp[]) {
   for (const r of regs) if (r.test(t)) return true;
   return false;
 }
+const isNumericSnowflake = (v: any) => typeof v === "string" ? /^\d+$/.test(v) : /^\d+$/.test(String(v));
 
 /* ======================= NEW-TWEET POLLER ======================= */
 export async function startCampaignStream(campaignId: string) {
@@ -161,8 +162,7 @@ export async function startCampaignStream(campaignId: string) {
     return;
   }
 
-  // ✅ FIX A: pre-mark the whole batch so rotation always advances,
-  // even if we break for time budget before touching some users.
+  // FIX A: pre-mark the batch so rotation advances even if we break early
   try {
     await User.updateMany(
       { _id: { $in: users.map(u => (u as any)._id) } },
@@ -179,26 +179,70 @@ export async function startCampaignStream(campaignId: string) {
   > = {};
 
   for (const u of users) {
-    // ✅ FIX B: soft budget check — break instead of throw
+    // FIX B: if budget is low, break cleanly (don’t throw)
     if (timeLeft() < 600) {
       console.warn("⏱ Budget low; breaking loop to finish cleanly");
       break;
     }
 
     try {
-      const params: Record<string, any> = {
+      // --- PREVALIDATE IDs ---
+      const userId = String((u as any).twitterId ?? "").trim();
+      const hasNumericUserId = isNumericSnowflake(userId);
+      if (!hasNumericUserId) {
+        console.warn(`△ Skipping @${u.username}: twitterId is not numeric (${userId})`);
+        await User.updateOne(
+          { _id: (u as any)._id },
+          { $set: { lastPolledAt: new Date(), nextPollAt: new Date(Date.now() + 60 * 60 * 1000) } }
+        );
+        continue;
+      }
+
+      const maybeSinceId = (u.sinceId ?? "").toString();
+      const hasValidSinceId = isNumericSnowflake(maybeSinceId);
+
+      // Build base params
+      const baseParams: Record<string, any> = {
         max_results: MAX_RESULTS,
         "tweet.fields": TWEET_FIELDS,
       };
-      if (u.sinceId) params.since_id = u.sinceId;
-      if (USE_ROLLING_WINDOW) params.start_time = nowIsoMinusDays(ROLLING_DAYS);
+      if (USE_ROLLING_WINDOW) baseParams.start_time = nowIsoMinusDays(ROLLING_DAYS);
 
-      const tl = await twitter.v2.userTimeline(u.twitterId, params);
-      const tweets = tl.data?.data ?? [];
+      // Try patterns to avoid 400s:
+      // 1) since_id + start_time (if sinceId valid)
+      // 2) only since_id
+      // 3) only start_time
+      const attemptParamsList: Record<string, any>[] = [];
+      if (hasValidSinceId) {
+        attemptParamsList.push({ ...baseParams, since_id: maybeSinceId });
+        attemptParamsList.push({ max_results: MAX_RESULTS, "tweet.fields": TWEET_FIELDS, since_id: maybeSinceId });
+      }
+      attemptParamsList.push({ max_results: MAX_RESULTS, "tweet.fields": TWEET_FIELDS, ...(USE_ROLLING_WINDOW ? { start_time: nowIsoMinusDays(ROLLING_DAYS) } : {}) });
+
+      let tweets: any[] = [];
+      let lastErr: any = null;
+
+      for (const p of attemptParamsList) {
+        try {
+          const tl = await twitter.v2.userTimeline(userId, p);
+          tweets = tl.data?.data ?? [];
+          lastErr = null;
+          break;
+        } catch (err: any) {
+          lastErr = err;
+          // If it’s a 400, try next param shape; if something else, break
+          const status = Number(err?.code || err?.data?.status || err?.status);
+          if (status !== 400) break;
+          console.warn(`↻ Retrying @${u.username} with different params due to 400`);
+        }
+      }
+      if (lastErr && !tweets.length) {
+        throw lastErr;
+      }
 
       console.log(`ℹ @${u.username} fetched ${tweets.length} tweets`);
 
-      let newest: string | null = u.sinceId || null;
+      let newest: string | null = (hasValidSinceId ? maybeSinceId : u.sinceId) || null;
       let matchedCount = 0;
 
       for (const tw of tweets) {
@@ -207,8 +251,6 @@ export async function startCampaignStream(campaignId: string) {
 
         matchedCount++;
         totalMatchedTweets++;
-
-        console.log(`✅ @${u.username} matched tweet ${tw.id}`);
 
         const score = scoreCreatorPost(
           {
@@ -219,8 +261,6 @@ export async function startCampaignStream(campaignId: string) {
           },
           0
         );
-
-        console.log(`   Calculated score: ${score}`);
 
         await TrackedTweet.updateOne(
           {
@@ -257,8 +297,6 @@ export async function startCampaignStream(campaignId: string) {
         if (!newest || BigInt(tw.id) > BigInt(newest)) newest = tw.id;
       }
 
-      console.log(`📝 Summary @${u.username}: ${matchedCount} matched tweets`);
-
       const nextPollAt =
         matchedCount > 0
           ? new Date(Date.now() + ACTIVE_BACKOFF_MS)
@@ -269,7 +307,7 @@ export async function startCampaignStream(campaignId: string) {
         {
           $set: {
             sinceId: newest ?? u.sinceId ?? null,
-            lastPolledAt: new Date(),   // kept
+            lastPolledAt: new Date(),
             nextPollAt,
           },
         }
@@ -339,6 +377,7 @@ export async function startCampaignStream(campaignId: string) {
     { $set: { data: merged, updatedAt: new Date() } },
     { upsert: true }
   );
+
   console.log(
     `✅ Leaderboard updated for ${campaignId}: ${
       deltaRows.length
