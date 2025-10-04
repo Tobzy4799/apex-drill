@@ -51,8 +51,8 @@ const TrackedTweet =
 
 /* ----------------------- Tunables ----------------------- */
 const SOFT_BUDGET_MS = 7000;
-const MAX_USERS_PER_RUN = 5; // your current choice
-const MAX_RESULTS = 2;
+const MAX_USERS_PER_RUN = 5; // your current setting
+const MAX_RESULTS = 6;
 const TWEET_FIELDS = "public_metrics,author_id,text,created_at";
 const USE_ROLLING_WINDOW = true;
 const ROLLING_DAYS = 3;
@@ -90,7 +90,6 @@ function matchesAny(text: string, regs: RegExp[]) {
   for (const r of regs) if (r.test(t)) return true;
   return false;
 }
-const isNumeric = (s?: string | null) => !!s && /^\d+$/.test(String(s).trim());
 
 /* ======================= NEW-TWEET POLLER ======================= */
 export async function startCampaignStream(campaignId: string) {
@@ -143,9 +142,12 @@ export async function startCampaignStream(campaignId: string) {
   let users = dueUsers;
   if (users.length < MAX_USERS_PER_RUN) {
     const need = MAX_USERS_PER_RUN - users.length;
-    const exclude = users.map((u) => (u as any)._id);
+    const exclude = users.map((u) => u._id);
     const topUp = await User.find(
-      { enabled: { $ne: false }, _id: { $nin: exclude } },
+      {
+        enabled: { $ne: false },
+        _id: { $nin: exclude },
+      },
       fields
     )
       .sort({ lastPolledAt: 1, _id: 1 })
@@ -159,7 +161,8 @@ export async function startCampaignStream(campaignId: string) {
     return;
   }
 
-  // Pre-mark batch so rotation always advances (even if we break early)
+  // ✅ FIX A: pre-mark the whole batch so rotation always advances,
+  // even if we break for time budget before touching some users.
   try {
     await User.updateMany(
       { _id: { $in: users.map(u => (u as any)._id) } },
@@ -176,122 +179,26 @@ export async function startCampaignStream(campaignId: string) {
   > = {};
 
   for (const u of users) {
-    if (timeLeft() < 700) {
+    // ✅ FIX B: soft budget check — break instead of throw
+    if (timeLeft() < 600) {
       console.warn("⏱ Budget low; breaking loop to finish cleanly");
       break;
     }
 
     try {
-      // --- Ensure we have a numeric user ID; resolve from username if needed
-      let userId = String((u as any).twitterId ?? "").trim();
-      if (!isNumeric(userId)) {
-        const uname = String((u as any).username ?? "").replace(/^@/, "");
-        if (!uname) {
-          console.warn(`△ Skipping user with no username and bad twitterId: ${(u as any)._id}`);
-          await User.updateOne(
-            { _id: (u as any)._id },
-            { $set: { nextPollAt: new Date(Date.now() + 60 * 60 * 1000) } }
-          );
-          continue;
-        }
-        try {
-          console.log(`🔎 Resolving numeric ID for @${uname}`);
-          const res = await twitter.v2.userByUsername(uname);
-          const resolvedId = res?.data?.id;
-          if (isNumeric(resolvedId)) {
-            userId = resolvedId!;
-            await User.updateOne(
-              { _id: (u as any)._id },
-              { $set: { twitterId: userId } }
-            );
-            console.log(`✅ Resolved @${uname} → ${userId}`);
-          } else {
-            console.warn(`✖ Could not resolve numeric ID for @${uname}`);
-            await User.updateOne(
-              { _id: (u as any)._id },
-              { $set: { nextPollAt: new Date(Date.now() + 60 * 60 * 1000) } }
-            );
-            continue;
-          }
-        } catch (resolveErr: any) {
-          console.warn(`✖ Username lookup failed for @${uname}: ${resolveErr?.message || resolveErr}`);
-          await User.updateOne(
-            { _id: (u as any)._id },
-            { $set: { nextPollAt: new Date(Date.now() + 60 * 60 * 1000) } }
-          );
-          continue;
-        }
-      }
+      const params: Record<string, any> = {
+        max_results: MAX_RESULTS,
+        "tweet.fields": TWEET_FIELDS,
+      };
+      if (u.sinceId) params.since_id = u.sinceId;
+      if (USE_ROLLING_WINDOW) params.start_time = nowIsoMinusDays(ROLLING_DAYS);
 
-      // --- Build safe attempts
-      const maybeSinceId = (u.sinceId ?? "").toString().trim();
-      const hasValidSinceId = isNumeric(maybeSinceId);
-
-      const attempts: Record<string, any>[] = [];
-      // Prefer start_time-only first (avoids brittle pair)
-      if (USE_ROLLING_WINDOW) {
-        attempts.push({
-          max_results: MAX_RESULTS,
-          "tweet.fields": TWEET_FIELDS,
-          start_time: nowIsoMinusDays(ROLLING_DAYS),
-        });
-      } else {
-        attempts.push({ max_results: MAX_RESULTS, "tweet.fields": TWEET_FIELDS });
-      }
-      // since_id only
-      if (hasValidSinceId) {
-        attempts.push({
-          max_results: MAX_RESULTS,
-          "tweet.fields": TWEET_FIELDS,
-          since_id: maybeSinceId,
-        });
-      }
-      // pair (sometimes ok)
-      if (USE_ROLLING_WINDOW && hasValidSinceId) {
-        attempts.push({
-          max_results: MAX_RESULTS,
-          "tweet.fields": TWEET_FIELDS,
-          start_time: nowIsoMinusDays(ROLLING_DAYS),
-          since_id: maybeSinceId,
-        });
-      }
-      // final: no filters
-      attempts.push({ max_results: MAX_RESULTS, "tweet.fields": TWEET_FIELDS });
-
-      let tweets: any[] = [];
-      let lastErr: any = null;
-
-      for (let i = 0; i < attempts.length; i++) {
-        const p = attempts[i];
-        try {
-          console.log(`➡️ userTimeline(@${u.username}/${userId}) attempt ${i + 1}: ${JSON.stringify(p)}`);
-          const tl = await twitter.v2.userTimeline(userId, p);
-          tweets = tl.data?.data ?? [];
-          lastErr = null;
-          break;
-        } catch (err: any) {
-          lastErr = err;
-          const status = Number(err?.code || err?.data?.status || err?.status);
-          const title = err?.data?.title ?? err?.data?.error ?? err?.message;
-          console.warn(`❌ attempt ${i + 1} failed @${u.username} (status=${status}): ${title}`);
-          if (status && status !== 400) break; // 403/401/429 — don’t keep trying shapes
-        }
-      }
-
-      if (lastErr && !tweets.length) {
-        if (hasValidSinceId) {
-          console.warn(`🧹 Clearing bad sinceId (${maybeSinceId}) for @${u.username} after repeated 400s`);
-          await User.updateOne(
-            { _id: (u as any)._id },
-            { $set: { sinceId: null, nextPollAt: new Date(Date.now() + 15 * 60 * 1000) } }
-          );
-        }
-        throw lastErr;
-      }
+      const tl = await twitter.v2.userTimeline(u.twitterId, params);
+      const tweets = tl.data?.data ?? [];
 
       console.log(`ℹ @${u.username} fetched ${tweets.length} tweets`);
 
-      let newest: string | null = (hasValidSinceId ? maybeSinceId : u.sinceId) || null;
+      let newest: string | null = u.sinceId || null;
       let matchedCount = 0;
 
       for (const tw of tweets) {
@@ -300,6 +207,8 @@ export async function startCampaignStream(campaignId: string) {
 
         matchedCount++;
         totalMatchedTweets++;
+
+        console.log(`✅ @${u.username} matched tweet ${tw.id}`);
 
         const score = scoreCreatorPost(
           {
@@ -311,8 +220,13 @@ export async function startCampaignStream(campaignId: string) {
           0
         );
 
+        console.log(`   Calculated score: ${score}`);
+
         await TrackedTweet.updateOne(
-          { campaignId: new mongoose.Types.ObjectId(campaignId), tweetId: tw.id! },
+          {
+            campaignId: new mongoose.Types.ObjectId(campaignId),
+            tweetId: tw.id!,
+          },
           {
             $setOnInsert: {
               authorId: tw.author_id!,
@@ -343,6 +257,8 @@ export async function startCampaignStream(campaignId: string) {
         if (!newest || BigInt(tw.id) > BigInt(newest)) newest = tw.id;
       }
 
+      console.log(`📝 Summary @${u.username}: ${matchedCount} matched tweets`);
+
       const nextPollAt =
         matchedCount > 0
           ? new Date(Date.now() + ACTIVE_BACKOFF_MS)
@@ -353,7 +269,7 @@ export async function startCampaignStream(campaignId: string) {
         {
           $set: {
             sinceId: newest ?? u.sinceId ?? null,
-            lastPolledAt: new Date(),
+            lastPolledAt: new Date(),   // kept
             nextPollAt,
           },
         }
@@ -373,6 +289,7 @@ export async function startCampaignStream(campaignId: string) {
   }
 
   ensureTime(300);
+
   console.log(`Total matched tweets this run: ${totalMatchedTweets}`);
 
   const deltaRows = Object.values(deltaMap);
@@ -413,7 +330,9 @@ export async function startCampaignStream(campaignId: string) {
     }
   }
 
-  const merged = Array.from(totalsById.values()).sort((a, b) => b.score - a.score);
+  const merged = Array.from(totalsById.values()).sort(
+    (a, b) => b.score - a.score
+  );
 
   await Leaderboard.updateOne(
     { campaignId: new mongoose.Types.ObjectId(campaignId) },
@@ -421,7 +340,12 @@ export async function startCampaignStream(campaignId: string) {
     { upsert: true }
   );
   console.log(
-    `✅ Leaderboard updated for ${campaignId}: ${deltaRows.length} authors got points, total delta points: ${deltaRows.reduce((s, r) => s + r.score, 0)}`
+    `✅ Leaderboard updated for ${campaignId}: ${
+      deltaRows.length
+    } authors got points, total delta points: ${deltaRows.reduce(
+      (sum, r) => sum + r.score,
+      0
+    )}`
   );
 }
 
