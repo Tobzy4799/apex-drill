@@ -58,33 +58,61 @@ export async function startCampaignStream(campaignId: string) {
       allTweets.push(...(realData?.data || []));
       allUsers.push(...(realData?.includes?.users || []));
       pageCount++;
-      console.log(`📄 Page ${pageCount} fetched, tweets so far: ${allTweets.length}`);
+      console.log(
+        `📄 Page ${pageCount} fetched, tweets so far: ${allTweets.length}`
+      );
       if (pageCount >= 5) break; // limit to 5 pages (~500 tweets)
     } while (await paginator.fetchNext());
 
-    console.log(`✅ Total tweets fetched: ${allTweets.length}, users: ${allUsers.length}`);
+    console.log(
+      `✅ Total tweets fetched: ${allTweets.length}, users: ${allUsers.length}`
+    );
 
     // 🧠 Fetch existing leaderboard
     const existing = (await Leaderboard.findOne({
       campaignId: new mongoose.Types.ObjectId(campaignId),
-    }).lean()) as { 
-      data?: { author_id: string; username: string; avatar: string; score: number }[] 
+    }).lean()) as {
+      data?: {
+        author_id: string;
+        username: string;
+        avatar: string;
+        score: number;
+      }[];
+      tweets?: Record<
+        string,
+        { author_id: string; score: number; last_metrics: any }
+      >;
     } | null;
 
+    // existing leaderboard users
     const existingData =
-      existing?.data?.reduce<Record<string, { author_id: string; username: string; avatar: string; score: number }>>(
-        (acc, entry) => {
-          acc[entry.author_id] = entry;
-          return acc;
-        },
-        {}
-      ) || {};
+      existing?.data?.reduce<
+        Record<
+          string,
+          { author_id: string; username: string; avatar: string; score: number }
+        >
+      >((acc, entry) => {
+        acc[entry.author_id] = entry;
+        return acc;
+      }, {}) || {};
 
-    // 🧾 Temporary in-memory leaderboard updates
+    // existing tweets (to track engagement deltas)
+    const existingTweetData: Record<
+      string,
+      { author_id: string; score: number; last_metrics: any }
+    > = existing?.tweets || {};
+
+    // leaderboard map initialized with old data
     const leaderboardMap: Record<
       string,
       { author_id: string; username: string; avatar: string; score: number }
     > = { ...existingData };
+
+    // persistent tweet store
+    const tweetStore: Record<
+      string,
+      { author_id: string; score: number; last_metrics: any }
+    > = { ...existingTweetData };
 
     // 🧮 Process fetched tweets
     for (const tweet of allTweets) {
@@ -97,7 +125,8 @@ export async function startCampaignStream(campaignId: string) {
       const userData = allUsers.find((u) => u.id === authorId);
       const followersCount = userData?.public_metrics?.followers_count || 0;
 
-      const score = scoreCreatorPost(
+      // compute new score
+      const newScore = scoreCreatorPost(
         {
           id: tweet.id!,
           text: tweet.text,
@@ -107,28 +136,52 @@ export async function startCampaignStream(campaignId: string) {
         followersCount
       );
 
+      // if we've seen this tweet before → only take the difference
+      const previous = tweetStore[tweet.id!];
+      const oldScore = previous?.score || 0;
+      const delta = newScore - oldScore;
+
       if (!leaderboardMap[authorId]) {
         leaderboardMap[authorId] = {
           author_id: authorId,
           username: regUser.username || userData?.username || "Unknown",
-          avatar: regUser.avatar || userData?.profile_image_url || "/avatar1.png",
+          avatar:
+            regUser.avatar || userData?.profile_image_url || "/avatar1.png",
           score: 0,
         };
       }
 
-      leaderboardMap[authorId].score += score;
+      // only apply the difference in score
+      leaderboardMap[authorId].score += delta;
+
+      // update stored tweet data
+      tweetStore[tweet.id!] = {
+        author_id: authorId,
+        score: newScore,
+        last_metrics: tweet.public_metrics,
+      };
     }
 
-    // 🏆 Sort and update
-    const leaderboard = Object.values(leaderboardMap).sort((a, b) => b.score - a.score);
+    // 🏆 Sort and save cumulative leaderboard
+    const leaderboard = Object.values(leaderboardMap).sort(
+      (a, b) => b.score - a.score
+    );
 
     await Leaderboard.updateOne(
       { campaignId: new mongoose.Types.ObjectId(campaignId) },
-      { $set: { data: leaderboard, updatedAt: new Date() } },
+      {
+        $set: {
+          data: leaderboard,
+          tweets: tweetStore, // ✅ persist tweet history
+          updatedAt: new Date(),
+        },
+      },
       { upsert: true }
     );
 
-    console.log(`✅ Leaderboard updated for ${campaignId}, entries: ${leaderboard.length}`);
+    console.log(
+      `✅ Leaderboard updated for ${campaignId}, entries: ${leaderboard.length}`
+    );
   } catch (err) {
     console.error(`❌ Error fetching leaderboard for ${campaignId}:`, err);
   }
