@@ -2,7 +2,6 @@
 import mongoose, { Schema, Document, Model } from "mongoose";
 
 export interface ICampaign extends Document {
-  _id: string; // ✅ explicitly add _id
   title: string;
   description: string;
   keywords: string[]; // array of keywords
